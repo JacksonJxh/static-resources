@@ -1,0 +1,26 @@
+# .github/workflows/sync-cnb.yml
+# GitHub 为源站，CNB 为纯镜像站，追求最小延迟同步
+
+name: Sync to CNB
+
+on:
+  push:
+    paths-ignore:
+      - '.github/**'
+  workflow_dispatch:
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Push to CNB
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_ACCESS_TOKEN }}
+          CNB_USERNAME: ${{ secrets.CNB_USERNAME }}
+          CNB_REPO_URL: ${{ secrets.CNB_REPO_URL }}
+        run: |
+          git push -f "https://${CNB_USERNAME}:${CNB_TOKEN}@${CNB_REPO_URL}" HEAD

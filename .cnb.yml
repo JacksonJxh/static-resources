@@ -1,0 +1,29 @@
+# ============================ 可复用片段（锚点定义） ============================
+.docker-image: &docker-image
+  image: docker.cnb.cool/xzydm/mirrors/debian:13-all
+
+.runner4: &runner4
+  cpus: 4
+  tags: cnb:arch:amd64
+
+.runner2: &runner2
+  cpus: 2
+  tags: cnb:arch:amd64
+$:
+  # vscode 事件：专供页面中启动远程开发用
+  vscode:
+    - docker:
+        image: docker.cnb.cool/xzydm/mirrors/debian:13-all
+      services:
+        - docker
+        - name: vscode
+          options:
+            onlyPreview: false
+            launch: python keepalive.py
+            keepAliveTimeout: 3600000
+            daemon: true
+            backup: false
+      stages:
+        - name: ls
+          script: ls
+
