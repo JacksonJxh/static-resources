@@ -1,0 +1,231 @@
+name: Deploy to EdgeOne Pages (Makers)
+
+# 与 .github/workflows/deploy.yml (GitHub Pages) 同级、并列、互不干扰。
+# 目标：在 GitHub Actions 开发环境内构建纯静态产物，通过 EdgeOne 官方 CLI
+#       以「直接上传」方式发布到 EdgeOne Pages(Makers)。
+# 关键点：上传目录不含 edge-functions/cloud-functions/package.json，
+#         不触发平台 function 构建 → 走静态资源额度，免费不占函数额度。
+#
+# 前置 Secrets（在仓库 Settings → Secrets 配置）：
+#   EDGEONE_API_TOKEN   EdgeOne 国际站（console.intl.cloud.tencent.com）创建的 API Token
+#                       用于部署到「全球可用区（不含中国大陆）」加速区域
+#   EDGEONE_PROJECT_NAME 国际站 Makers 项目名称（如 static-resources，首次自动创建）
+# CNAME 文件为 GitHub Pages 独有，本流水线已显式排除。
+#
+# ⚠️ 触发开关：默认【禁用自动触发】。EdgeOne 部署改由 CNB 的 web_trigger 按钮
+#    手动触发（更可控，避免每次 push 都消耗构建次数）。如需在 GitHub 侧启用，
+#    取消下方 on: 段的注释即可。
+#
+on:
+#   push:
+#     branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "部署环境"
+        required: false
+        default: "production"
+        type: choice
+        options:
+          - production
+          - preview
+
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "edgeone-pages"
+  cancel-in-progress: true
+
+env:
+  # Makers skill 硬性要求：所有 edgeone 命令前必须设置
+  PAGES_SOURCE: skills
+  # 加速区域由 CLI 的 -a/--area 参数指定（不是环境变量）：
+  #   global   = 全球可用区（含中国大陆）
+  #   overseas = 全球可用区（不含中国大陆）← 本项目使用
+  # 部署命令中已用 -a overseas 指定，Token 也需为国际站创建。
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source files
+        uses: actions/checkout@v4
+
+      # ========== 复用现有 deploy.yml 的「目录索引生成」逻辑 ==========
+      - name: Generate directory indexes (template-based)
+        run: |
+          set -e
+          TPL_FILE=".github/templates/dir-template.html"
+          ROOT_INDEX_SRC="./index.html"
+          tpl_raw=$(cat "${TPL_FILE}")
+
+          find . -type d \
+            -not -path '.' \
+            -not -path './.git*' \
+            -not -path './.github*' \
+            -not -path './.codebuddy*' \
+            -not -path './healthycheck*' \
+            -print0 | while IFS= read -r -d '' dir; do
+            display_path="${dir#./}"
+            html_content=$(echo "${tpl_raw}" | perl -pe "s|\{\{DIR_PATH\}\}|${display_path}|g")
+            items=""
+            for entry in "$dir"/*/; do
+              [ -e "$entry" ] || continue
+              n=$(basename "$entry")
+              items+="<li><a href=\"$n/\">📁 $n/</a></li>"$'\n'
+            done
+            for entry in "$dir"/*; do
+              [ -e "$entry" ] || continue
+              bn=$(basename "$entry")
+              if [ -f "$entry" ] && [ "$bn" != "index.html" ]; then
+                items+="<li><a href=\"$bn\">📄 $bn</a></li>"$'\n'
+              fi
+            done
+            mkdir -p "$dir"
+            echo "${html_content}" | perl -0777 -pe "s|<!-- DYNAMIC_ITEMS -->|${items}|g" > "${dir}/index.html"
+          done
+
+          # 根目录文件/文件夹列表注入首页
+          root_items=""
+          for entry in ./*/; do
+            [ -e "$entry" ] || continue
+            n=$(basename "$entry")
+            case "$n" in
+              .github|.codebuddy|.git) continue ;;
+            esac
+            root_items+="<li><a href=\"$n/\">📁 $n/</a></li>"$'\n'
+          done
+          for entry in ./*; do
+            [ -e "$entry" ] || continue
+            bn=$(basename "$entry")
+            if [ -f "$entry" ] && [ "$bn" != "index.html" ] && [ "$bn" != ".nojekyll" ] && [ "$bn" != "CNAME" ]; then
+              root_items+="<li><a href=\"$bn\">📄 $bn</a></li>"$'\n'
+            fi
+          done
+          root_html=$(cat "${ROOT_INDEX_SRC}" | perl -0777 -pe "s|<!-- ROOT_DIR_ITEMS -->|${root_items}|g")
+          echo "${root_html}" > "${ROOT_INDEX_SRC}"
+
+      # ========== 复用现有 deploy.yml 的「healthcheck 页面生成」逻辑 ==========
+      - name: Generate healthcheck page from template
+        run: |
+          set -euo pipefail
+          if [ ! -f ".github/templates/healthcheck.html" ]; then
+            echo "::error::healthcheck 模板文件缺失: .github/templates/healthcheck.html"
+            exit 1
+          fi
+          mkdir -p healthycheck
+          cp ".github/templates/healthcheck.html" "healthycheck/index.html"
+          if [ ! -f "healthycheck/index.html" ]; then
+            echo "::error::healthycheck/index.html 生成失败"
+            exit 1
+          fi
+          echo "healthycheck page generated: $(wc -c < healthycheck/index.html) bytes"
+
+      # ========== 整理纯静态产物到发布目录（排除元数据） ==========
+      - name: Prepare static release directory
+        run: |
+          set -euo pipefail
+          SRC="$(pwd)"
+          DST="${SRC}/dist-release"
+          rm -rf "${DST}"
+          mkdir -p "${DST}"
+          # 仅复制静态内容，排除仓库元数据/CI 配置/项目内部目录
+          rsync -a --exclude='.git' \
+                    --exclude='.github' \
+                    --exclude='.codebuddy' \
+                    --exclude='.nojekyll' \
+                    --exclude='CNAME' \
+                    --exclude='dist-release' \
+                    "${SRC}/" "${DST}/"
+          echo "Release directory prepared: ${DST}"
+          ls -la "${DST}"
+
+      # ========== 移除赞助内容（仅 EO 发布副本，不动源仓库 index.html） ==========
+      # GitHub Pages 保留赞助行；部署到 EdgeOne 等外部平台时不该包含该内容。
+      - name: Strip sponsor line for external deploy
+        run: |
+          set -euo pipefail
+          SRC_INDEX="${DST}/index.html"
+          if [ -f "${SRC_INDEX}" ]; then
+            # 删除包含 freecdn.vip 赞助链接的整行
+            grep -v 'freecdn.vip' "${SRC_INDEX}" > "${SRC_INDEX}.tmp" && mv "${SRC_INDEX}.tmp" "${SRC_INDEX}"
+            echo "Sponsor line removed from release index.html"
+          else
+            echo "release index.html not found, skip"
+          fi
+
+      # ========== 安装 EdgeOne CLI 并校验版本 ==========
+      - name: Install EdgeOne CLI
+        run: |
+          set -euo pipefail
+          npm install -g edgeone@latest
+          # edgeone -v 会输出 ASCII banner + 版本号，需提取纯数字版本（形如 x.y.z）
+          RAW="$(edgeone -v 2>/dev/null)"
+          VER="$(printf '%s' "$RAW" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+          echo "edgeone version: ${VER}"
+          if [ -z "${VER}" ]; then
+            echo "::error::无法解析 edgeone CLI 版本号，原始输出: ${RAW}"
+            exit 1
+          fi
+          # 要求 >= 1.6.0（低于该版本在非交互环境会挂起且缺 --json）
+          if [ "$(printf '%s\n' 1.6.0 "$VER" | sort -V | head -n1)" != "1.6.0" ]; then
+            echo "::error::edgeone CLI 版本过低 ($VER)，需 >= 1.6.0"
+            exit 1
+          fi
+
+      # ========== 纯静态上传（不触发 function 构建） ==========
+      - name: Deploy static to EdgeOne Pages (Makers)
+        id: deploy
+        env:
+          EDGEONE_API_TOKEN: ${{ secrets.EDGEONE_API_TOKEN }}
+          EDGEONE_PROJECT_NAME: ${{ secrets.EDGEONE_PROJECT_NAME }}
+          DEPLOY_ENV: ${{ github.event.inputs.env || 'production' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${EDGEONE_API_TOKEN}" ]; then
+            echo "::error::缺少 Secret EDGEONE_API_TOKEN"
+            exit 1
+          fi
+          if [ -z "${EDGEONE_PROJECT_NAME}" ]; then
+            echo "::error::缺少 Secret EDGEONE_PROJECT_NAME"
+            exit 1
+          fi
+          # 直接上传已构建目录；-a overseas 指定「全球不含中国大陆」加速区域
+          # （edgeone CLI 自带 -a/--area 参数，不接受任何 EDGEONE_SITE 类环境变量）
+          PAGES_SOURCE=skills edgeone makers deploy ./dist-release \
+            -n "${EDGEONE_PROJECT_NAME}" \
+            -t "${EDGEONE_API_TOKEN}" \
+            -e "${DEPLOY_ENV}" \
+            -a overseas \
+            --json > deploy_result.json
+          echo "deploy output:"
+          cat deploy_result.json
+
+      # ========== 解析部署 URL 写入 Action Summary ==========
+      - name: Parse deploy result & write summary
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -f deploy_result.json ]; then
+            echo "::warning::未找到 deploy_result.json，跳过 Summary 写入"
+            exit 0
+          fi
+          # 取最后一行 JSON
+          LAST=$(tail -n 1 deploy_result.json)
+          STATUS=$(echo "$LAST" | python3 -c "import sys,json;print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
+          URL=$(echo "$LAST" | python3 -c "import sys,json;print(json.load(sys.stdin).get('url',''))" 2>/dev/null || echo "")
+          if [ "$STATUS" = "success" ] && [ -n "$URL" ]; then
+            {
+              echo "# 🌐 EdgeOne Pages 部署成功"
+              echo ""
+              echo "**访问地址（含鉴权参数，勿截断）:**"
+              echo ""
+              echo "\`\`\`"
+              echo "$URL"
+              echo "\`\`\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::部署未返回成功状态，请检查上方日志"
+          fi
