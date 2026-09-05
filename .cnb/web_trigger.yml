@@ -1,0 +1,25 @@
+branch:
+  - reg: ^main$
+    buttons:
+      - name: 部署静态站点
+        description: 生成目录索引与 healthcheck 页面，并部署到 EdgeOne 国际站（全球不含中国大陆）
+        event: web_trigger_deploy
+        groupName: 部署操作
+        inputs:
+          deploy_env:
+            name: 部署环境
+            description: 对应 EdgeOne 部署环境
+            type: select
+            required: true
+            default: production
+            options:
+              - name: 生产环境
+                value: production
+              - name: 预览环境
+                value: preview
+          pages_source:
+            name: 页面源
+            description: 传入 edgeone 的 PAGES_SOURCE 变量
+            type: input
+            required: false
+            default: skills
