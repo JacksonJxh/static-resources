@@ -1,0 +1,70 @@
+# .github/workflows/clean-old-images.yml
+# 每周清理超过 3 个月的 img 文件夹，push 后自动触发 sync-cnb.yml 同步到 CNB
+
+name: Clean Old Images
+
+on:
+  schedule:
+    # 每周一 UTC 04:00（北京时间 12:00）
+    - cron: '0 4 * * 1'
+  workflow_dispatch:   # 允许手动触发
+
+jobs:
+  clean:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Delete images older than 3 months
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          REPO: JacksonJxh/static-resources
+        run: |
+          git config user.email "ci@github.com"
+          git config user.name "GitHub CI"
+          # 使用 PAT 配置远程地址
+          git remote set-url origin https://${GH_TOKEN}@github.com/${REPO}.git
+
+          # 计算 3 个月前的日期（格式: YYYY/MM/DD）
+          CUTOFF=$(date -d '3 months ago' +%Y/%m/%d)
+          echo "Cutoff date: $CUTOFF"
+
+          # 遍历 img/YYYY/MM/DD 目录，删除早于截止日期的文件夹
+          DELETED=false
+          for year_dir in img/*/; do
+            [ -d "$year_dir" ] || continue
+            year=$(basename "$year_dir")
+            for month_dir in "$year_dir"*/; do
+              [ -d "$month_dir" ] || continue
+              month=$(basename "$month_dir")
+              for day_dir in "$month_dir"*/; do
+                [ -d "$day_dir" ] || continue
+                day=$(basename "$day_dir")
+                current_path="${year}/${month}/${day}"
+                if [[ "$current_path" < "$CUTOFF" ]]; then
+                  echo "Deleting: $day_dir"
+                  git rm -r "$day_dir"
+                  DELETED=true
+                fi
+              done
+              # 删除空的月份目录
+              if [ -d "$month_dir" ] && [ -z "$(ls -A "$month_dir")" ]; then
+                rm -rf "$month_dir"
+              fi
+            done
+            # 删除空的年份目录
+            if [ -d "$year_dir" ] && [ -z "$(ls -A "$year_dir")" ]; then
+              rm -rf "$year_dir"
+            fi
+          done
+
+          if [ "$DELETED" = true ]; then
+            git commit -m "chore: 清理超过 3 个月的图片"
+            git push origin main
+          else
+            echo "No old images to delete."
+          fi
