@@ -1,0 +1,215 @@
+# ============================================================================
+# CNB 流水线配置（被动镜像仓库）
+#
+# 本仓库由 GitHub 的 sync-cnb.yml 通过 OpenAPI 触发本流水线完成镜像同步。
+#
+# 同步策略（api_trigger_sync，工作区增量同步 + 单 commit 镜像）：
+#   思路：commit 与 GitHub 分离，CNB 端始终保持「仅 1 个 commit」，内容恒为最新。
+#   第一步：添加 github 远程并 fetch，以「工作区」为维度增量同步——
+#           GitHub 新增的文件 pull 进来、修改的覆盖、删除的从工作区移除，
+#           全程以 GitHub 远程为准（不合并 GitHub 的历史 commit）。
+#   第二步：把同步好的最新工作区重置为单个 orphan commit（清理历史），
+#           再强制推送回 CNB 远程，使 CNB 的 commit 永远只有 1 个且内容最新。
+#   优点：避免 cnb-init-from 全量迁移，以增量方式增删改工作区，节省同步时间。
+#
+# 触发约定：
+#   - 不配置 push / crontab 触发，避免镜像同步形成循环触发；
+#   - 保留「API 触发的 GitHub→CNB 镜像同步（api_trigger_sync）」由 GitHub 通过 OpenAPI 调用；
+#   - 仅保留「手动按钮（web_trigger）/ API（api_trigger）」触发的静态部署能力。
+#
+# web_trigger 事件名必须以 web_trigger / web_trigger_ 开头；
+# api_trigger 事件名必须以 api_trigger / api_trigger_ 开头；
+# 页面按钮在 .cnb/web_trigger.yml 中定义，其 event 需与本文件中的事件名一致。
+#
+# 部署所需密钥（EDGEONE_API_TOKEN / EDGEONE_PROJECT_NAME / GH_PAT / GITHUB_TOKEN）
+# 写在密钥仓库 xzydm/xzsecret 的 static-resources-secrets.yml 中。
+# ⚠️ imports 必须写在【具体事件内部】才会对该事件的 stage 注入环境变量
+#    （放在顶层/main 之外无效）。本文件的 api_trigger_sync 事件内已引入。
+#
+# ⚠️ 加速区域（含/不含中国大陆）由 CLI 的 -a/--area 参数指定（不是环境变量）：
+#    - -a global   → 全球可用区（含中国大陆）
+#    - -a overseas → 全球可用区（不含中国大陆）← 本项目使用
+#    部署命令已加 -a overseas；Token 也需为 EdgeOne 国际站创建。
+#    本文件不含任何虚构的 EDGEONE_SITE 变量。
+# ============================================================================
+
+main:
+  # ========== GitHub 源站 → CNB 镜像 同步（由 GitHub 通过 OpenAPI 触发 api_trigger_sync） ==========
+  # 工作区增量同步 + 单 commit 镜像方案：以 GitHub 远程为准增量增删改工作区，
+  # 最后重置为单个 orphan commit 并强制推送回 CNB，使 CNB 的 commit 永远只有 1 个。
+  api_trigger_sync:
+
+    - runner:
+        cpus: 2
+        tags: cnb:arch:amd64
+          # 密钥仓库写在事件内部，向本事件 stage 注入 GH_PAT / GITHUB_TOKEN 等环境变量
+      imports:
+        - "https://cnb.cool/xzydm/xzsecret/-/blob/main/static-resources-secrets.yml"
+      env:
+        # 源站仓库地址（public，无需凭证）
+        SRC_REPO_URL: "https://github.com/JacksonJxh/static-resources.git"
+        # 源站与镜像均使用默认 main 分支，不做动态识别
+        SYNC_BRANCH_NAME: "main"
+        # GitHub Pages 产物分支（由 CNB 构建后强制推送）
+        GH_PAGES_BRANCH: "gh-pages"
+        # GitHub 推送凭证 GH_PAT / GITHUB_TOKEN 由本事件内的 imports 注入为环境变量，
+        # 脚本内直接读取 ${GH_PAT}（回退 ${GITHUB_TOKEN}）即可，无需在此重复声明。
+        # 以下为 CNB 构建环境内置变量，无需重复定义：
+        #   CNB_TOKEN_USER_NAME —— 固定为 cnb（用于 commit author）
+        #   本流水线在 CNB 内执行，git 已内置临时令牌与推送权限，无需再拼 token URL
+      lock:
+        key: github-mirror-sync
+        wait: true
+        cancel-in-wait: true
+      stages:
+        - name: workspace-incremental-sync
+          script: |
+            set -euo pipefail
+            REPO_ROOT="$(pwd)"
+            : "${SRC_REPO_URL:?SRC_REPO_URL 未设置}"
+            : "${SYNC_BRANCH_NAME:?SYNC_BRANCH_NAME 未设置}"
+
+            # ---- 0. 基础配置 ----
+            git config user.name  "${CNB_TOKEN_USER_NAME:-cnb}"
+            git config user.email "${CNB_TOKEN_USER_NAME:-cnb}@cnb.cool"
+            git config advice.detachedHead false
+
+            # ---- 1. 添加 github 远程并 fetch（仅取对象，不合并历史）----
+            if git remote | grep -qx github; then
+              git remote set-url github "${SRC_REPO_URL}"
+            else
+              git remote add github "${SRC_REPO_URL}"
+            fi
+            echo "==> fetching github (incremental objects only) ..."
+            git fetch github
+
+            GITHUB_REF="github/${SYNC_BRANCH_NAME}"
+            echo "==> github ref: ${GITHUB_REF}"
+
+            # ---- 2. 以 github 工作区为准，增量增删改本地工作区 ----
+            # 2a. 清空索引（不碰工作区文件本身）
+            git rm -r --cached -q . || true
+            # 2b. 用 github 的 tree 覆盖工作区与索引：新增/修改以 github 为准
+            git checkout "${GITHUB_REF}" -- .
+            # 2c. 清理 github 已删除的本地残留文件（实现"删除也同步"）
+            #     -e 排除 .git，避免误删版本库；如需保留 CNB 特有文件可在此追加 -e 规则
+            git clean -fd -e .git
+
+            echo "==> workspace synced to github state (incremental)"
+
+            # ---- 3. 重置为单个 commit 并强制推送回 CNB（commit 永远只有 1 个）----
+            # 3a. 用 orphan 分支重新提交，历史被完全清理
+            SYNC_BRANCH="__sync_single_commit"
+            git checkout --orphan "${SYNC_BRANCH}"
+            git add -A
+            git commit -m "sync: github workspace @ $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+            # 3b. 本流水线在 CNB 内执行，git 已内置临时令牌与推送权限，直接强制推送
+            git push --force origin "${SYNC_BRANCH}:${SYNC_BRANCH_NAME}"
+
+            echo "Mirror sync completed: ${SRC_REPO_URL} -> ${SYNC_BRANCH_NAME} (single commit)"
+
+            # ---- 4. 构建 GitHub Pages 产物并推送到 GitHub 的 gh-pages 分支 ----
+            # 把"重活"（目录索引生成 / healthcheck / .nojekyll）放在稳定的 CNB runner 上完成，
+            # 仅将最终静态产物以单 commit 推到 GitHub 的 gh-pages，
+            # 由 GitHub Actions 的 deploy.yml 只做轻量 upload + deploy（避免 GitHub runner 排队）。
+            # 推送凭证：优先 GH_PAT，回退 GITHUB_TOKEN（二者均由本事件 imports 注入）。
+            PUSH_TOKEN="${GH_PAT:-${GITHUB_TOKEN:-}}"
+
+            if [ -z "${PUSH_TOKEN}" ]; then
+              echo "==> GH_PAT/GITHUB_TOKEN 均未设置，跳过 GitHub Pages 产物推送（CNB 镜像同步不受影响）"
+            else
+              # 模板用 REPO_ROOT 绝对路径引用（rsync 已排除 .github，且 cd 后相对路径失效）
+              TPL_FILE="${REPO_ROOT}/.github/templates/dir-template.html"
+              HEALTHCHECK_TPL="${REPO_ROOT}/.github/templates/healthcheck.html"
+              ROOT_INDEX_SRC="./index.html"
+              BUILD_DIR="/tmp/gh-pages-build"
+              rm -rf "${BUILD_DIR}"; mkdir -p "${BUILD_DIR}"
+
+              # 4a. 复制当前已同步的最新工作区（排除仓库元数据、CI 配置）
+              rsync -a --exclude='.git' --exclude='.github' --exclude='.cnb.yml' \
+                --exclude='.codebuddy' ./ "${BUILD_DIR}/"
+
+              cd "${BUILD_DIR}"
+
+              # 4b. 生成目录索引（复用 deploy.yml 的核心逻辑）
+              tpl_raw=$(cat "${TPL_FILE}")
+              find . -type d -not -path '.' -not -path './.git*' -not -path './.github*' \
+                -not -path './healthycheck*' -print0 | while IFS= read -r -d '' dir; do
+                display_path="${dir#./}"
+                html_content=$(echo "${tpl_raw}" | perl -pe "s|\{\{DIR_PATH\}\}|${display_path}|g")
+                items=""
+                for entry in "$dir"/*/; do
+                  [ -e "$entry" ] || continue
+                  n=$(basename "$entry")
+                  items+="<li><a href=\"$n/\">📁 $n/</a></li>"$'\n'
+                done
+                for entry in "$dir"/*; do
+                  [ -e "$entry" ] || continue
+                  bn=$(basename "$entry")
+                  if [ -f "$entry" ] && [ "$bn" != "index.html" ]; then
+                    items+="<li><a href=\"$bn\">📄 $bn</a></li>"$'\n'
+                  fi
+                done
+                mkdir -p "$dir"
+                echo "${html_content}" | perl -0777 -pe "s|<!-- DYNAMIC_ITEMS -->|${items}|g" > "${dir}/index.html"
+              done
+
+              # 根目录列表注入首页 index.html
+              root_items=""
+              for entry in ./*/; do
+                [ -e "$entry" ] || continue
+                n=$(basename "$entry")
+                [ "$n" = ".github" ] && continue
+                root_items+="<li><a href=\"$n/\">📁 $n/</a></li>"$'\n'
+              done
+              for entry in ./*; do
+                [ -e "$entry" ] || continue
+                bn=$(basename "$entry")
+                if [ -f "$entry" ] && [ "$bn" != "index.html" ] && [ "$bn" != ".nojekyll" ] && [ "$bn" != "CNAME" ]; then
+                  root_items+="<li><a href=\"$bn\">📄 $bn</a></li>"$'\n'
+                fi
+              done
+              root_html=$(cat "${ROOT_INDEX_SRC}" | perl -0777 -pe "s|<!-- ROOT_DIR_ITEMS -->|${root_items}|g")
+              echo "${root_html}" > "${ROOT_INDEX_SRC}"
+
+              # 4c. healthcheck 页面
+              mkdir -p healthycheck
+              cp "${HEALTHCHECK_TPL}" "healthycheck/index.html"
+
+              # 4d. .nojekyll（GitHub Pages 关闭 Jekyll）
+              touch .nojekyll
+
+              # 4e. 以单 commit 强制推送到 GitHub 的 gh-pages 分支
+              git init -q
+              git checkout -b "${GH_PAGES_BRANCH}"
+              git add -A
+              git -c user.name="${CNB_TOKEN_USER_NAME:-cnb}" \
+                  -c user.email="${CNB_TOKEN_USER_NAME:-cnb}@cnb.cool" \
+                commit -m "deploy: github pages build @ $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              GH_PUSH_URL="https://${PUSH_TOKEN}@${SRC_REPO_URL#https://}"
+              git push --force "${GH_PUSH_URL}" "${GH_PAGES_BRANCH}"
+
+              echo "GitHub Pages artifact pushed to ${GH_PAGES_BRANCH} (single commit)"
+              cd "${REPO_ROOT}"
+            fi
+
+$:
+  # vscode 事件：专供页面中启动远程开发用
+  vscode:
+    - docker:
+        image: docker.cnb.cool/xzydm/mirrors/debian:13-all
+      runner:
+        cpus: 4
+        tags: cnb:arch:amd64
+      services:
+        - docker
+        - name: vscode
+          options:
+            onlyPreview: false
+            launch: python keepalive.py
+            keepAliveTimeout: 3600000
+            daemon: true
+      stages:
+        - name: star
+          script: ls
