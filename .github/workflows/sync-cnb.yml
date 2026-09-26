@@ -1,0 +1,45 @@
+name: Sync to CNB (API Trigger)
+
+on:
+  push:
+#    paths-ignore:
+#      - '.github/**'
+  workflow_dispatch:
+
+
+jobs:
+  trigger-cnb-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger CNB mirror sync pipeline (no real transfer)
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_ACCESS_TOKEN }}
+          CNB_REPO_URL: ${{ secrets.CNB_REPO_URL }}   # 形如 https://cnb.cool/abcde/static-resources
+          CNB_BRANCH: main
+        run: |
+          set -euo pipefail
+
+          # 从 CNB_REPO_URL 解析 组织/仓库 (https://cnb.cool/{org}/{repo})
+          URL_PATH="${CNB_REPO_URL#https://}"
+          URL_PATH="${URL_PATH#cnb.cool/}"
+          CNB_ORG="${URL_PATH%%/*}"
+          CNB_REPO="${URL_PATH##*/}"
+
+          echo "Triggering CNB pipeline: ${CNB_ORG}/${CNB_REPO} @ ${CNB_BRANCH}"
+
+          RESP=$(curl -sS -X POST \
+            "https://api.cnb.cool/${CNB_ORG}/${CNB_REPO}/-/build/start" \
+            -H "Authorization: Bearer ${CNB_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"branch\": \"${CNB_BRANCH}\",
+              \"event\": \"api_trigger_sync\",
+              \"sync\": \"false\",
+              \"title\": \"GitHub push 触发的镜像同步\",
+              \"env\": {
+                \"TRIGGER_SOURCE\": \"github-actions\"
+              }
+            }")
+
+          echo "CNB trigger response:"
+          echo "${RESP}"
