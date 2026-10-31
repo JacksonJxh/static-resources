@@ -1,0 +1,35 @@
+# .github/workflows/clean-history.yml
+# 定期清理 commit 历史，force push 后自动触发 sync-cnb.yml 同步到 CNB
+name: Clean Commit History
+
+on:
+  schedule:
+    # UTC 04:00 = 北京时间12:00
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+jobs:
+  clean:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # 关键：不使用内置token，后续手动替换remote url
+          persist-credentials: false
+      - name: Clean commit history & Force Push
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          REPO: JacksonJxh/static-resources
+          OWNER: JacksonJxh
+        run: |
+          git config user.email "ci@github.com"
+          git config user.name "GitHub CI"
+          git checkout --orphan clear_tmp
+          git add -A
+          git commit -m "chore: 重置历史，压缩提交记录"
+          git branch -D main
+          git branch -m main
+          git remote set-url origin https://${GH_TOKEN}@github.com/${REPO}.git
+          git push -f origin main
