@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "esa": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "-p", "mcp-server-esa", "mcp-server-esa"],
+      "env": {
+        "ALIBABA_CLOUD_ACCESS_KEY_ID": "${ALIBABA_CLOUD_ACCESS_KEY_ID}",
+        "ALIBABA_CLOUD_ACCESS_KEY_SECRET": "${ALIBABA_CLOUD_ACCESS_KEY_SECRET}"
+      },
+      "description": "阿里云 ESA MCP Server（全量模式：Pages 部署 / 边缘函数 ER / 站点 Site 管理）"
+    }
+  }
+}
